@@ -30,6 +30,7 @@ class SyncViewBox(pg.ViewBox):
 
     def mouseDragEvent(self, ev, axis=None):
         super().mouseDragEvent(ev, axis)
+        return
         if ev.isAccepted():
             for view in self.linked_views:
                 view.setXRange(*self.viewRange()[0], padding=0)
@@ -60,7 +61,7 @@ class AudioViewer(pg.PlotWidget):
         self.setMouseEnabled(x=True, y=False)
         self.setLabel('bottom', 'Time (s)')
 
-        # self.hideAxis('left')
+        self.hideAxis('left')
         self.plotItem.showGrid(x=True, y=True)
 
         self.setBackground(QColor(50, 50, 50))  # 暗灰色/ # 设置坐标轴和文本颜色为浅色（适合暗背景）
@@ -240,6 +241,7 @@ class SpectrogramViewer(pg.PlotWidget):
         # 设置背景和坐标轴
         self.setBackground(QColor(30, 30, 30))  # 更暗的背景
         
+        self.hideAxis('left')
         # 创建图像项
         self.img = pg.ImageItem()
         self.addItem(self.img)
@@ -657,8 +659,8 @@ class AudioLabeler(QMainWindow):
     def display_spectrogram(self):
         """使用 NumPy 计算稳定的频谱图"""
         # STFT参数
-        n_fft = 256
-        hop_length = 64
+        n_fft = (self.sample_rate // 1000) * 4
+        hop_length = n_fft // 2
 
         # 设置显示范围
         duration = len( self.audio_data ) / self.sample_rate
