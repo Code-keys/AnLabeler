@@ -1,22 +1,123 @@
 import os
+import glob
 import json
 import numpy as np
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QLabel, QFileDialog, QSlider, QMessageBox,
                             QInputDialog, QListWidget, QListWidgetItem, QSplitter, QStatusBar)
 from PyQt5.QtCore import Qt, QTimer, QRectF, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QBrush
+
 import pyqtgraph as pg
 import soundfile as sf
 import librosa
 import librosa.display
 from scipy.io import wavfile
 
-import glob
+import wave
+import pyaudio
+import pyaudio._portaudio as pa
+from threading import Event, Thread
 
 def find_wav_files(folder_path):
     """使用glob查找所有WAV文件（包括子文件夹）"""
     return glob.glob(os.path.join(folder_path, '**/*.wav'), recursive=True)
+
+class AudioPlayCanStop(Thread):
+    """
+    多线程播放。新线程播放，主线程不会被阻塞，可以暂停、启动、循环播放。
+    """
+    stream = None
+    p = pyaudio.PyAudio()  # 创建一个播放器
+
+    def __init__(self, file=None, loop=False, file_data=None, sr=0, bw=0, ch=0, lambda_func=None):
+        super().__init__()
+        self.file = file
+        self.sampwidth = bw
+        self.channels = ch
+        self.rate = sr
+        self.format = pyaudio.get_format_from_width(self.sampwidth)
+
+        self.call_back = lambda_func
+
+        self.data = self.init_data() if file else file_data
+
+        self.CHUNK = int(0.050 * self.rate) * self.channels * self.sampwidth
+        if AudioPlayCanStop.stream != None:
+            AudioPlayCanStop.stream.stop_stream()
+            AudioPlayCanStop.stream.close()
+        self.stream = AudioPlayCanStop.stream = \
+            AudioPlayCanStop.p.open(format=self.format, channels=self.channels, rate=self.rate, output=True)
+
+        self.__flag = Event()  # 用于暂停线程的标识
+        self.__flag.set()
+        self.shutdown = False
+        self.loop = loop
+
+    def init_data(self):
+        if self.file is not None:
+            self.wf = wave.open(self.file, 'rb')  # 只读方式打开wav文件
+            self.sampwidth = self.wf.getsampwidth()  # 采样位宽
+            self.channels = self.wf.getnchannels()
+            self.rate = self.wf.getframerate()
+            self.format = pyaudio.get_format_from_width(self.sampwidth)
+            return self.wf
+
+    def get_date(self, pos=0):
+        if self.file is not None:
+            self.wf.setpos(pos)
+            self.data = self.wf.readframes(self.CHUNK)
+
+        else:
+            self.data = self.data[pos: pos+self.CHUNK]
+
+        return self.data
+
+    def run(self):
+        self.playOnce()
+        if self.shutdown:  # 如果是停止的，那么结束线程。
+            return
+        while self.loop:
+            self.playOnce()
+            if self.shutdown:  # 如果是”手动停止“的，那么主动结束线程的执行内容。
+                return
+        if not self.shutdown:
+            self.release()
+
+    def playOnce(self, idx=0):
+        """
+        执行一轮的音乐播放，如果需要循环执行，则多次进入此函数。
+        :return:
+        """
+        if len(self.data) == 0:
+            self.wf.close()
+            self.wf = wave.open(self.file, 'rb')
+            self.data = self.wf.readframes(self.CHUNK)
+        while not self.shutdown and len(self.data) > 0:
+            self.__flag.wait()
+            # 播放
+            self.stream.write(self.data)
+            self.data = self.wf.readframes(self.CHUNK)
+        if self.shutdown:
+            self.release()
+            return
+        else:
+            return
+    def release(self):
+        self.stream.stop_stream()
+        self.stream.close()
+        self.p.terminate()
+    def pause(self):
+        self.__flag.clear()  # 设置为False, 让线程阻塞
+        # dprint("pause playing audio")
+    def resume(self):
+        self.__flag.set()  # 设置为True, 让线程停止阻塞
+        # dprint("resume playing audio")
+    def stop(self):
+        # dprint('I am stopping playing audio...')
+        self.shutdown = True
+        self.loop = False
 
 class SyncViewBox(pg.ViewBox):
     """同步缩放视图"""
@@ -133,7 +234,7 @@ class AudioViewer(pg.PlotWidget):
     def set_playback_pos(self, pos):
         """设置播放位置指示器"""
         if self.playback_pos is None:
-            self.playback_pos = pg.InfiniteLine(pos, angle=90, pen=pg.mkPen('r', width=2))
+            self.playback_pos = pg.InfiniteLine(pos, angle=90, pen=pg.mkPen('r', width=8))
             self.addItem(self.playback_pos)
         else:
             self.playback_pos.setValue(pos)
@@ -275,6 +376,10 @@ class SpectrogramViewer(pg.PlotWidget):
         # 设置图像数据
         self.img.setImage(data.T, autoLevels=True)  # 转置使时间轴在x方向
 
+        # print(data.shape)
+        # for id, i in enumerate(data.T):
+        #     print(id, i[-5:] )
+
         # 设置坐标范围
         # if extent is not None:
         #     self.img.setRect(QRectF(*extent))
@@ -297,6 +402,7 @@ class AudioLabeler(QMainWindow):
         
         self.audio_data = None
         self.sample_rate = None
+
         self.file_path = None
         self.labels = []
         self.current_label_index = -1
@@ -309,11 +415,12 @@ class AudioLabeler(QMainWindow):
         self.init_menubar()
         
         # 音频播放相关
+        # self.audio_player = AudioPlayCanStop()
         self.playback_timer = QTimer()
         self.playback_timer.timeout.connect(self.update_playback)
         self.is_playing = False
         self.playback_start_pos = 0
-        
+
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -643,6 +750,9 @@ class AudioLabeler(QMainWindow):
         duration = len(self.audio_data) / self.sample_rate
         time_axis = np.linspace(0, duration, len(self.audio_data))
 
+        # 计算并显示频谱图
+        # self.audio_player.set_audio(self.audio_data, self.sample_rate)
+
         # 更新波形显示
         self.waveform_view.set_waveform(time_axis, self.audio_data)
         
@@ -659,44 +769,60 @@ class AudioLabeler(QMainWindow):
     def display_spectrogram(self):
         """使用 NumPy 计算稳定的频谱图"""
         # STFT参数
-        n_fft = (self.sample_rate // 1000) * 4
+        n_fft = (self.sample_rate // 1000) * 1 # 8ms
         hop_length = n_fft // 2
 
+        print(f"n_fft: {n_fft}, hop_length: {hop_length}, self.sample_rate : {self.sample_rate}")
+
         # 设置显示范围
-        duration = len( self.audio_data ) / self.sample_rate
         max_freq = self.sample_rate / 2
+        duration = len( self.audio_data ) / self.sample_rate
         extent = (0, duration, 0, max_freq)
 
-        if 1:
+        TYPE = 1
+        if TYPE==1 or TYPE==2:
             stft = librosa.stft(self.audio_data.astype(np.float32), n_fft=n_fft, hop_length=hop_length)
+            # 1. 使用librosa计算de频谱图 Good
             spectrogram = librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+            # spectrogram -= spectrogram.min()
+
+            if TYPE==2:
+                # 2. Mel滤波器组 
+                mel_filter = librosa.filters.mel(sr=self.sample_rate, n_fft=n_fft, n_mels=80)
+                mel_spectrogram = np.dot(mel_filter, np.abs(stft) ** 2)  # 功率谱 → Mel谱
+                spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)  # Log压缩
+
         else:
             audio_mono = self.audio_data.astype(np.float32)
-            # audio_mono = audio_mono / np.max(np.abs(audio_mono))  # 归一化到[-1,1]
+            audio_mono = audio_mono / np.max(np.abs(audio_mono))  # 归一化到[-1,1]
 
             # 使用NumPy手动计算STFT
             window = np.hanning(n_fft)
             stft = np.array([
-                np.fft.rfft(window * audio_mono[i:i+n_fft], n=n_fft)
-                for i in range(0, len(audio_mono)-n_fft, hop_length)
+                np.fft.rfft(window * audio_mono[i: i+n_fft], n=n_fft) for i in range(0, len(audio_mono)-n_fft, hop_length)
             ]).T  # 转置得到 (频率bins, 时间帧)
 
-            # 幅度转dB（数值稳定实现）
-            magnitude = np.abs(stft)
-            spectrogram = 20 * np.log10(
-                np.maximum(magnitude, 1e-12) / np.max(magnitude)  # 避免log(0)
-            )
-            print(f"Spectrogram shape: {spectrogram.shape},"
-                f"Range: [{np.nanmin(spectrogram):.1f}, {np.nanmax(spectrogram):.1f}] dB")
-            
-        spectrogram -= spectrogram.mean()
+            def amplitude_to_db_numpy(S, ref=1.0, amin=1e-9, top_db=80.0, power=True):
+                # 1. 确保输入为正值，并应用最小阈值
+                magnitude = np.abs(S) if not power else np.abs(S) ** 2
+                magnitude = np.maximum(magnitude, amin)
+                # 2. 计算对数能量（分贝）
+                log_spec = 10 * np.log10(magnitude) if power else 20 * np.log10(magnitude)
+                # 3. 相对参考值归一化
+                log_spec -= 10 * np.log10(ref) if power else 20 * np.log10(ref)
+                # 4. 动态范围限制（可选）
+                if top_db is not None:
+                    log_spec = np.maximum(log_spec, log_spec.max() - top_db)
+                return log_spec
+
+            spectrogram = amplitude_to_db_numpy(stft)
 
         self.spectrogram_view.set_spectrogram(spectrogram - np.nanmin(spectrogram), extent)
 
     def play_audio(self):
         if self.audio_data is None:
             return
-            
+
         # 获取当前选择区域
         selection = self.waveform_view.get_selection()
         
@@ -731,7 +857,7 @@ class AudioLabeler(QMainWindow):
             
         # 更新播放位置
         current_time = self.time_slider.value() / 1000.0
-        new_pos = int(current_time * self.sample_rate) + int(0.05 * self.sample_rate)
+        new_pos = int(current_time * self.sample_rate) + int(0.050 * self.sample_rate)
         
         # 检查是否到达结束位置
         selection = self.waveform_view.get_selection()
@@ -750,12 +876,12 @@ class AudioLabeler(QMainWindow):
         
         # 更新播放位置指示器
         self.waveform_view.set_playback_pos(new_pos / self.sample_rate)
-    
+
     def slider_moved(self, value):
         # 滑块移动时更新播放位置
         time_pos = value / 1000.0
         self.waveform_view.set_playback_pos(time_pos)
-        
+
         # 如果在播放中，更新播放位置
         if self.is_playing:
             self.playback_start_pos = int(time_pos * self.sample_rate)
